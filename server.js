@@ -7,7 +7,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
 // ── EXTRACT VIDEO SOURCES FROM URL ──
 app.get('/extract', async (req, res) => {
