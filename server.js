@@ -9,145 +9,169 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 
-// ── EXTRACT VIDEO SOURCES FROM URL ──
+// Video URL patterns
+const VIDEO_PATTERNS = [
+  /https?:\/\/[^\s"'<>\\]+\.mp4(?:[^\s"'<>\\]*)?/gi,
+  /https?:\/\/[^\s"'<>\\]+\.m3u8(?:[^\s"'<>\\]*)?/gi,
+  /https?:\/\/[^\s"'<>\\]+\.webm(?:[^\s"'<>\\]*)?/gi,
+];
+
+const SCRIPT_PATTERNS = [
+  /["']file["']\s*:\s*["'](https?[^"']+\.(?:mp4|m3u8|webm)[^"']*)/gi,
+  /["']src["']\s*:\s*["'](https?[^"']+\.(?:mp4|m3u8)[^"']*)/gi,
+  /["']url["']\s*:\s*["'](https?[^"']+\.(?:mp4|m3u8)[^"']*)/gi,
+  /["']source["']\s*:\s*["'](https?[^"']+\.(?:mp4|m3u8)[^"']*)/gi,
+  /["']hls["']\s*:\s*["'](https?[^"']+\.m3u8[^"']*)/gi,
+  /source\s*:\s*["'](https?[^"']+\.(?:mp4|m3u8)[^"']*)/gi,
+  /file\s*:\s*["'](https?[^"']+\.(?:mp4|m3u8)[^"']*)/gi,
+  /["']videoUrl["']\s*:\s*["'](https?[^"']+)/gi,
+  /["']streamUrl["']\s*:\s*["'](https?[^"']+)/gi,
+  /["']hlsUrl["']\s*:\s*["'](https?[^"']+\.m3u8[^"']*)/gi,
+];
+
+async function fetchPage(url) {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Referer': url,
+    'Cache-Control': 'no-cache',
+  };
+  const res = await fetch(url, { headers, timeout: 20000 });
+  return await res.text();
+}
+
+function extractFromHtml(html, baseUrl) {
+  const found = new Set();
+  const $ = cheerio.load(html);
+
+  // 1. Video tags
+  $('video, video source').each((i, el) => {
+    const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src');
+    if (src && isVideoSrc(src)) found.add(makeAbsolute(src, baseUrl));
+  });
+
+  // 2. iframes (YouTube, Dailymotion, etc.)
+  $('iframe').each((i, el) => {
+    const src = $(el).attr('src') || $(el).attr('data-src');
+    if (src && isEmbedUrl(src)) found.add(src.startsWith('//') ? 'https:' + src : src);
+  });
+
+  // 3. Script tags - deep search
+  $('script').each((i, el) => {
+    const content = $(el).html() || '';
+    SCRIPT_PATTERNS.forEach(pattern => {
+      pattern.lastIndex = 0;
+      let m;
+      while ((m = pattern.exec(content)) !== null) {
+        if (m[1] && m[1].startsWith('http')) found.add(m[1].split('\\n')[0].split('"')[0]);
+      }
+    });
+  });
+
+  // 4. Raw regex on full HTML
+  VIDEO_PATTERNS.forEach(pattern => {
+    pattern.lastIndex = 0;
+    let m;
+    while ((m = pattern.exec(html)) !== null) {
+      const clean = m[0].replace(/\\+/g, '').replace(/['">\s]/g, '');
+      if (clean.startsWith('http')) found.add(clean);
+    }
+  });
+
+  // 5. data attributes
+  $('[data-video-src],[data-src],[data-file],[data-url],[data-stream]').each((i, el) => {
+    ['data-video-src','data-src','data-file','data-url','data-stream'].forEach(attr => {
+      const val = $(el).attr(attr);
+      if (val && isVideoSrc(val)) found.add(makeAbsolute(val, baseUrl));
+    });
+  });
+
+  return [...found].filter(u => u && u.length < 600);
+}
+
+function isVideoSrc(url) {
+  return /\.(mp4|webm|m3u8|mkv|ogg)(\?|$|#)/i.test(url) ||
+         url.includes('googlevideo.com') ||
+         (url.includes('cdn') && /video/i.test(url));
+}
+
+function isEmbedUrl(url) {
+  return url.includes('youtube.com/embed') ||
+         url.includes('dailymotion.com/embed') ||
+         url.includes('vimeo.com/video') ||
+         url.includes('ok.ru/videoembed') ||
+         url.includes('player.');
+}
+
+function makeAbsolute(url, base) {
+  if (url.startsWith('http')) return url;
+  if (url.startsWith('//')) return 'https:' + url;
+  try { return new URL(url, base).href; } catch { return url; }
+}
+
+// Try to find iframe src and fetch that too
+async function fetchIframeSources(html, baseUrl) {
+  const found = new Set();
+  const $ = cheerio.load(html);
+  const iframes = [];
+
+  $('iframe').each((i, el) => {
+    const src = $(el).attr('src') || $(el).attr('data-src');
+    if (src && src.startsWith('http') && !isEmbedUrl(src)) iframes.push(src);
+  });
+
+  for (const iframeSrc of iframes.slice(0, 3)) {
+    try {
+      const iframeHtml = await fetchPage(iframeSrc);
+      const sources = extractFromHtml(iframeHtml, iframeSrc);
+      sources.forEach(s => found.add(s));
+    } catch(e) {}
+  }
+
+  return [...found];
+}
+
+// Main extract endpoint
 app.get('/extract', async (req, res) => {
   const url = req.query.url;
-  if (!url) return res.json({ error: 'No URL provided', sources: [] });
-
-  const found = [];
+  if (!url) return res.json({ error: 'No URL', sources: [] });
 
   try {
-    // Fetch the page HTML
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'ar,en;q=0.9',
-        'Referer': url
-      },
-      timeout: 15000
+    // Fetch main page
+    const html = await fetchPage(url);
+    let sources = extractFromHtml(html, url);
+
+    // If not enough found, try iframes
+    if (sources.filter(s => isVideoSrc(s)).length === 0) {
+      const iframeSources = await fetchIframeSources(html, url);
+      sources = [...new Set([...sources, ...iframeSources])];
+    }
+
+    // Sort: direct video files first
+    sources.sort((a, b) => {
+      const aScore = /\.(mp4|webm)(\?|$)/i.test(a) ? 2 : /\.m3u8/i.test(a) ? 1 : 0;
+      const bScore = /\.(mp4|webm)(\?|$)/i.test(b) ? 2 : /\.m3u8/i.test(b) ? 1 : 0;
+      return bScore - aScore;
     });
 
-    const html = await response.text();
-    const $ = cheerio.load(html);
-
-    // 1. Direct video tags
-    $('video source, video').each((i, el) => {
-      const src = $(el).attr('src') || $(el).attr('data-src');
-      if (src && src.startsWith('http') && isVideoUrl(src) && !found.includes(src)) {
-        found.push(src);
-      }
-    });
-
-    // 2. iframe sources (embedded players)
-    $('iframe').each((i, el) => {
-      const src = $(el).attr('src') || $(el).attr('data-src');
-      if (src && src.startsWith('http')) {
-        // Check for known embed patterns
-        if (src.includes('youtube.com/embed') || 
-            src.includes('dailymotion.com/embed') ||
-            src.includes('vimeo.com/video') ||
-            src.includes('ok.ru/videoembed')) {
-          if (!found.includes(src)) found.push(src);
-        }
-      }
-    });
-
-    // 3. Regex scan for mp4/webm/m3u8 in HTML
-    const videoRegex = /https?:\/\/[^\s"'<>\\]+\.(?:mp4|webm|m3u8|mkv)(?:[^"'<>\s\\]*)?/gi;
-    const matches = html.match(videoRegex) || [];
-    matches.forEach(u => {
-      const clean = u.replace(/\\+/g, '').split('"')[0].split("'")[0];
-      if (!found.includes(clean)) found.push(clean);
-    });
-
-    // 4. JSON data in script tags (common in Arabic movie sites)
-    $('script').each((i, el) => {
-      const content = $(el).html() || '';
-      
-      // Look for file: "url" patterns
-      const patterns = [
-        /["']file["']\s*:\s*["'](https?[^"']+\.mp4[^"']*)/gi,
-        /["']src["']\s*:\s*["'](https?[^"']+\.mp4[^"']*)/gi,
-        /["']url["']\s*:\s*["'](https?[^"']+\.mp4[^"']*)/gi,
-        /["']source["']\s*:\s*["'](https?[^"']+\.mp4[^"']*)/gi,
-        /["']hls["']\s*:\s*["'](https?[^"']+\.m3u8[^"']*)/gi,
-        /["']m3u8["']\s*:\s*["'](https?[^"']+\.m3u8[^"']*)/gi,
-        /sources\s*:\s*\[\s*\{[^}]*["']file["']\s*:\s*["'](https?[^"']+)/gi,
-      ];
-
-      patterns.forEach(pattern => {
-        let match;
-        while ((match = pattern.exec(content)) !== null) {
-          if (match[1] && !found.includes(match[1])) {
-            found.push(match[1]);
-          }
-        }
-      });
-
-      // Look for jwplayer setup
-      const jwMatch = content.match(/jwplayer\([^)]+\)\.setup\((\{[\s\S]*?\})\)/);
-      if (jwMatch) {
-        try {
-          const fileMatch = jwMatch[1].match(/["']file["']\s*:\s*["'](https?[^"']+)/);
-          if (fileMatch && !found.includes(fileMatch[1])) found.push(fileMatch[1]);
-        } catch(e) {}
-      }
-
-      // Look for plyr/videojs sources
-      const plyrMatch = content.match(/src\s*:\s*["'](https?[^"']+\.(?:mp4|m3u8)[^"']*)/gi);
-      if (plyrMatch) {
-        plyrMatch.forEach(m => {
-          const u = m.match(/["'](https?[^"']+)/);
-          if (u && !found.includes(u[1])) found.push(u[1]);
-        });
-      }
-    });
-
-    // 5. Check for data attributes
-    $('[data-video], [data-src], [data-url], [data-file]').each((i, el) => {
-      const attrs = ['data-video', 'data-src', 'data-url', 'data-file'];
-      attrs.forEach(attr => {
-        const val = $(el).attr(attr);
-        if (val && val.startsWith('http') && isVideoUrl(val) && !found.includes(val)) {
-          found.push(val);
-        }
-      });
-    });
-
-    // Clean and deduplicate
-    const cleaned = [...new Set(found)]
-      .filter(u => u && u.startsWith('http') && u.length < 500)
-      .slice(0, 10);
-
-    res.json({ 
-      success: true, 
-      sources: cleaned,
-      count: cleaned.length,
-      url: url
-    });
+    const final = [...new Set(sources)].slice(0, 8);
+    res.json({ success: true, sources: final, count: final.length });
 
   } catch (err) {
-    console.error('Extract error:', err.message);
-    res.json({ 
-      error: err.message, 
-      sources: [],
-      count: 0
-    });
+    res.json({ error: err.message, sources: [] });
   }
 });
 
-function isVideoUrl(url) {
-  return /\.(mp4|webm|m3u8|mkv|ogg|avi)(\?|$)/i.test(url) ||
-         url.includes('googlevideo') ||
-         url.includes('video') && url.includes('cdn');
-}
-
-// ── HEALTH CHECK ──
 app.get('/', (req, res) => {
-  res.json({ status: 'Party Watch Server Running 🎬', version: '1.0' });
+  res.json({ status: 'Party Watch Server Running 🎬', version: '2.0' });
 });
 
-app.listen(PORT, () => {
-  console.log(`🎬 Party Watch Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🎬 Server on port ${PORT}`));
+
+
